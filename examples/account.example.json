@@ -1,0 +1,10 @@
+{
+  "base_url": "https://api1.xianniu.com",
+  "access_token": "LOGIN_REQUIRED",
+  "game_id": 159,
+  "line_id": 1227,
+  "area_id": 1726,
+  "hardware": null,
+  "isp_type": 0,
+  "channel": "guanwang"
+}

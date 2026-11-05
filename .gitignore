@@ -1,0 +1,12 @@
+.research-deps/
+private/
+__pycache__/
+*.pcap
+*.pcapng
+*.etl
+dist/
+research/
+启动鲜牛记录工具.cmd
+.venv/
+*.egg-info/
+build/
