@@ -1,5 +1,6 @@
 """Build portable source artifacts from an explicit non-sensitive allowlist."""
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
 import tarfile
 import zipfile
@@ -30,4 +31,8 @@ with tarfile.open(output / 'xianniu-linux-0.1.0.tar.gz', 'w:gz') as archive:
         info.mode = 0o755 if relative == 'xianniu' else 0o644
         with path.open('rb') as stream:
             archive.addfile(info, stream)
+artifacts = [output / 'xianniu-linux-0.1.0.tar.gz', output / 'xianniu-linux-0.1.0.zip']
+(output / 'SHA256SUMS').write_text(''.join(
+    f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n' for path in artifacts),
+    encoding='ascii')
 print('\n'.join(str(path) for path in output.iterdir()))

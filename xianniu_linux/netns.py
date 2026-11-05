@@ -18,6 +18,8 @@ import time
 from .protocol import Session
 from .api import Account
 
+NETNS_ROOT = Path('/etc/netns')
+
 
 def select_subnet(routes):
     occupied = []
@@ -76,7 +78,10 @@ def run(args):
     if application[:1] == ['--']:
         application.pop(0)
     if not application:
-        raise ValueError('Specify an application after --, for example -- steam')
+        raise ValueError('Specify a game command after --; use warframe in Steam launch options')
+    if Path(application[0]).name.lower() in ('steam', 'steam.sh', 'steam.exe'):
+        raise ValueError('Launching all of Steam in the tunnel is disabled. '
+                         'Use warframe -- %command% in Warframe Steam launch options.')
     ip = shutil.which('ip')
     runuser = shutil.which('runuser')
     hev = shutil.which(args.hev)
@@ -88,11 +93,6 @@ def run(args):
         Account.load(account_path)
     else:
         Session.load(session_path)
-    if Path(application[0]).name == 'steam' and shutil.which('pgrep'):
-        if subprocess.run(['pgrep', '-u', str(uid), '-x', 'steam'],
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            raise ValueError('Fully exit the existing Steam client before launching Steam here')
-
     root = Path(__file__).resolve().parents[1]
     suffix = secrets.token_hex(3)
     namespace = f'xn-{uid}-{suffix}'
@@ -105,7 +105,9 @@ def run(args):
     os.chmod(runtime, 0o700)
     configuration = runtime / 'hev.yml'
     ready_file = runtime / 'ready.json'
-    netns_config = Path('/etc/netns') / namespace
+    status_file = runtime / 'status.json'
+    netns_config = NETNS_ROOT / namespace
+    proxy = None
     processes = []
     log_handles = []
     created_namespace = False
@@ -120,6 +122,10 @@ def run(args):
     def stop(signum, frame):
         nonlocal interrupted
         interrupted = True
+
+    def cancelled():
+        parent_alive = getattr(args, 'parent_alive', None)
+        return interrupted or (parent_alive is not None and not parent_alive())
 
     previous_handlers = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     environment = dict(os.environ)
@@ -151,7 +157,8 @@ def run(args):
         log_handles.append(proxy_log)
         proxy_command = [sys.executable, '-m', 'xianniu_linux', 'serve',
                          '--session', str(session_path), '--listen', host_ip,
-                         '--port', '0', '--ready-file', str(ready_file)]
+                         '--port', '0', '--ready-file', str(ready_file),
+                         '--status-file', str(status_file)]
         if account_path:
             proxy_command += ['--account', str(account_path)]
         proxy = subprocess.Popen(proxy_command,
@@ -160,7 +167,7 @@ def run(args):
         processes.append(proxy)
         deadline = time.monotonic() + 60
         while not ready_file.exists():
-            if interrupted or proxy.poll() is not None or time.monotonic() >= deadline:
+            if cancelled() or proxy.poll() is not None or time.monotonic() >= deadline:
                 raise ValueError(f'Proxy could not start; diagnostic directory: {runtime}')
             time.sleep(0.05)
         port = json.loads(ready_file.read_text())['port']
@@ -172,20 +179,23 @@ def run(args):
         processes.append(tunnel)
         deadline = time.monotonic() + 10
         while command(ip, '-n', namespace, 'link', 'show', 'xntun', check=False).returncode:
-            if interrupted or tunnel.poll() is not None or time.monotonic() >= deadline:
+            if cancelled() or tunnel.poll() is not None or time.monotonic() >= deadline:
                 raise ValueError(f'TUN could not start; diagnostic directory: {runtime}')
             time.sleep(0.05)
         command(ip, '-n', namespace, 'link', 'set', 'xntun', 'up')
         command(ip, '-n', namespace, 'route', 'add', 'default', 'dev', 'xntun')
         # There is no NAT or host forwarding: the guest reaches the local SOCKS
         # adapter over the connected veth; only that adapter reaches the node.
-        print(f'Launching application in {namespace}; TCP/UDP use classic mode.', flush=True)
+        print(f'Launching game in {namespace}; Steam stays on its original network.', flush=True)
+        game_environment = dict(getattr(args, 'game_environment', None) or environment)
+        game_environment.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+        game_cwd = getattr(args, 'game_cwd', None) or os.getcwd()
         game = subprocess.Popen([ip, 'netns', 'exec', namespace, runuser, '-u', account.pw_name,
-                                 '--', 'env', f'HOME={account.pw_dir}', f'XDG_RUNTIME_DIR=/run/user/{uid}',
-                                 f'DBUS_SESSION_BUS_ADDRESS={environment["DBUS_SESSION_BUS_ADDRESS"]}',
-                                 *application], env=environment, cwd=account.pw_dir)
+                                 '--', 'env', '-i', '--',
+                                 *(f'{key}={value}' for key, value in game_environment.items()),
+                                 *application], env=environment, cwd=game_cwd)
         processes.append(game)
-        while not interrupted:
+        while not cancelled():
             result = game.poll()
             if result is not None:
                 return result
@@ -196,38 +206,74 @@ def run(args):
     finally:
         # Only kill processes in the namespace we just created, never Steam or
         # other applications outside it. Always remove temporary networking.
-        if created_namespace:
-            result = command(ip, 'netns', 'pids', namespace, check=False)
-            for pid_text in result.stdout.split():
-                try:
-                    os.kill(int(pid_text), signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        for process in reversed(processes):
-            if process.poll() is None:
-                process.terminate()
-        for process in reversed(processes):
+        cleanup_errors = []
+
+        def attempt(action, *values):
             try:
-                process.wait(timeout=60 if process is processes[0] else 3)
+                return action(*values)
+            except ProcessLookupError:
+                return None
+            except (OSError, subprocess.SubprocessError) as error:
+                cleanup_errors.append(type(error).__name__)
+                return None
+
+        def namespace_signal(sig):
+            result = command(ip, 'netns', 'pids', namespace)
+            for pid_text in result.stdout.split():
+                attempt(os.kill, int(pid_text), sig)
+
+        def finish_process(process):
+            try:
+                process.wait(timeout=60 if process is proxy else 3)
             except subprocess.TimeoutExpired:
                 process.kill()
-                process.wait()
-        if created_namespace:
-            result = command(ip, 'netns', 'pids', namespace, check=False)
-            for pid_text in result.stdout.split():
-                try:
-                    os.kill(int(pid_text), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            command(ip, 'netns', 'delete', namespace, check=False)
-        if created_veth:
-            command(ip, 'link', 'delete', host_if, check=False)
-        if created_config:
-            (netns_config / 'resolv.conf').unlink(missing_ok=True)
-            netns_config.rmdir()
-        for handle in log_handles:
-            handle.close()
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
-        # Keep the small diagnostic directory so a failure can be inspected.
-        print(f'Acceleration networking removed. Diagnostics: {runtime}', flush=True)
+                process.wait(timeout=3)
+
+        def delete_host_link():
+            # Removing the namespace may already have destroyed both veth ends.
+            if command(ip, 'link', 'show', host_if, check=False).returncode == 0:
+                command(ip, 'link', 'delete', host_if)
+
+        try:
+            if created_namespace:
+                attempt(namespace_signal, signal.SIGTERM)
+            for process in reversed(processes):
+                if process.poll() is None:
+                    attempt(process.terminate)
+            for process in reversed(processes):
+                attempt(finish_process, process)
+            if created_namespace:
+                attempt(namespace_signal, signal.SIGKILL)
+                attempt(command, ip, 'netns', 'delete', namespace)
+            if created_veth:
+                attempt(delete_host_link)
+            if created_config:
+                attempt((netns_config / 'resolv.conf').unlink, True)
+                attempt(netns_config.rmdir)
+        finally:
+            for handle in log_handles:
+                handle.close()
+            for sig, handler in previous_handlers.items():
+                signal.signal(sig, handler)
+
+        if cleanup_errors:
+            print(f'Local network/process cleanup incomplete. Diagnostics: {runtime}',
+                  file=sys.stderr, flush=True)
+        else:
+            print(f'Acceleration networking removed. Diagnostics: {runtime}', flush=True)
+
+        if account_path and proxy is not None:
+            try:
+                status = json.loads(status_file.read_text(encoding='utf-8'))
+                confirmed = (isinstance(status, dict) and status.get('account_managed') is True
+                             and status.get('stop_confirmed') is True)
+            except (OSError, ValueError):
+                confirmed = False
+            if not confirmed:
+                raise ValueError('Server stop and billing pause could not be confirmed. '
+                                 f'Run stop --account "{account_path}" to retry. Diagnostics: {runtime}')
+            print('Server confirmed acceleration stopped and billing paused.', flush=True)
+        if proxy is not None and proxy.returncode != 0:
+            raise ValueError(f'Acceleration proxy failed (exit={proxy.returncode}). Diagnostics: {runtime}')
+        if cleanup_errors:
+            raise ValueError(f'Cleanup incomplete; inspect diagnostics: {runtime}')

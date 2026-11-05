@@ -7,6 +7,7 @@ from pathlib import Path
 import secrets
 import getpass
 from dataclasses import asdict, replace
+from contextlib import nullcontext
 import socket
 import signal
 import ssl
@@ -19,15 +20,33 @@ from .socks import SocksServer, read_address
 from .api import Account, ApiClient, ApiError
 from .control import Acceleration
 from .control import write_private_json
+from .locking import AccountLock
 
 
 async def serve(args):
+    with AccountLock() if args.account else nullcontext():
+        await _serve(args)
+
+
+async def worker(function, *args):
+    # Cancellation cannot stop a thread already changing the server/account.
+    # Join it before cleanup or before releasing the cross-process lock.
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
+
+
+async def _serve(args):
     address = ipaddress.IPv4Address(args.listen)
     if not (address.is_loopback or address.is_link_local):
         raise ValueError('Listen address must be loopback or a local link address')
     adapter = None
     server = None
     background = []
+    stop_confirmed = False
     manager = Acceleration(Account.load(args.account), args.session) if args.account else None
     main_task = asyncio.current_task()
     loop = asyncio.get_running_loop()
@@ -35,70 +54,82 @@ async def serve(args):
     try:
         if manager:
             print('Starting an authenticated acceleration session (normal service billing).', flush=True)
-            starting = asyncio.create_task(asyncio.to_thread(manager.start))
-            try:
-                started = await asyncio.shield(starting)
-            except asyncio.CancelledError:
-                await starting
-                raise
+            started = await worker(manager.start)
             print(json.dumps({'started': started}), flush=True)
-            await asyncio.to_thread(manager.refresh, {})
+            await worker(manager.refresh, {})
         Session.load(args.session)
         adapter = SocksServer(args.session, args.max_connections)
         server = await asyncio.start_server(adapter.handle, str(address), args.port, family=socket.AF_INET)
         actual_port = server.sockets[0].getsockname()[1]
         print(f'Classic TCP/UDP adapter listening at {address}:{actual_port}', flush=True)
         if args.ready_file:
-            args.ready_file.write_text(json.dumps({'port': actual_port}), encoding='utf-8')
+            write_private_json(args.ready_file, {'port': actual_port})
 
         async def refresh_loop():
             failures = 0
             while True:
                 await asyncio.sleep(args.refresh_interval)
                 try:
-                    await asyncio.to_thread(manager.refresh, dict(adapter.stats))
+                    await worker(manager.refresh, dict(adapter.stats))
                     failures = 0
                     print('Session credentials refreshed.', flush=True)
                 except ApiError as error:
                     failures += 1
                     print(f'Credential refresh failed: {error}', file=sys.stderr, flush=True)
                     if failures >= 2:
-                        main_task.cancel()
-                        return
+                        raise ApiError('Credential refresh failed twice; acceleration is stopping') from None
+                except Exception as error:
+                    # Unexpected schema/storage errors must also stop service;
+                    # do not echo exception values that could contain secrets.
+                    raise ApiError(f'Credential refresh failed ({type(error).__name__}); '
+                                   'acceleration is stopping') from None
 
         async def watch_stop_file():
             while not args.stop_file.exists():
                 await asyncio.sleep(0.2)
-            main_task.cancel()
 
         if manager:
             background.append(asyncio.create_task(refresh_loop()))
         if args.stop_file:
             background.append(asyncio.create_task(watch_stop_file()))
         async with server:
-            await server.serve_forever()
+            background.append(asyncio.create_task(server.serve_forever()))
+            done, _ = await asyncio.wait(background, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
     except asyncio.CancelledError:
         pass
     finally:
-        for task in background:
-            task.cancel()
-        await asyncio.gather(*background, return_exceptions=True)
-        if server:
-            server.close()
-            await server.wait_closed()
-        if adapter:
-            await adapter.close()
-        stats = dict(adapter.stats) if adapter else {}
-        if manager and (manager.active or manager.clock_owned):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            for task in background:
+                task.cancel()
+            await asyncio.gather(*background, return_exceptions=True)
             try:
-                await asyncio.to_thread(manager.stop, stats)
-                print('Server confirmed acceleration stopped and billing paused.', flush=True)
-            except ApiError:
-                print('Server stop could not be confirmed. Run stop --account <account.json> to retry.',
-                      file=sys.stderr, flush=True)
-                raise
-        signal.signal(signal.SIGTERM, old_term)
-        print(json.dumps({'statistics': stats}), flush=True)
+                if server:
+                    server.close()
+                    await server.wait_closed()
+                if adapter:
+                    await adapter.close()
+            finally:
+                stats = dict(adapter.stats) if adapter else {}
+                if manager and (manager.active or manager.clock_owned):
+                    try:
+                        await worker(manager.stop, stats)
+                        stop_confirmed = True
+                        print('Server confirmed acceleration stopped and billing paused.', flush=True)
+                    except Exception:
+                        print('Server stop could not be confirmed. Run stop --account <account.json> to retry.',
+                              file=sys.stderr, flush=True)
+                        raise
+                print(json.dumps({'statistics': stats}), flush=True)
+        finally:
+            try:
+                if getattr(args, 'status_file', None):
+                    write_private_json(args.status_file, {'account_managed': manager is not None,
+                                                          'stop_confirmed': stop_confirmed})
+            finally:
+                signal.signal(signal.SIGTERM, old_term)
 
 
 async def check(args):
@@ -179,27 +210,28 @@ async def check(args):
 
 
 async def managed_check(args):
+    with AccountLock():
+        return await _managed_check(args)
+
+
+async def _managed_check(args):
     manager = Acceleration(Account.load(args.account), args.session)
     try:
         print('Starting one authenticated acceleration session for this check.', flush=True)
-        starting = asyncio.create_task(asyncio.to_thread(manager.start))
-        try:
-            await asyncio.shield(starting)
-        except asyncio.CancelledError:
-            await starting
-            raise
-        await asyncio.to_thread(manager.refresh, {})
+        await worker(manager.start)
+        await worker(manager.refresh, {})
         print('Session start and credential refresh succeeded.', flush=True)
         return await check(args)
     finally:
         if manager.active or manager.clock_owned:
-            await asyncio.to_thread(manager.stop, getattr(args, 'check_stats', {}))
+            await worker(manager.stop, getattr(args, 'check_stats', {}))
             print('Server confirmed test session stopped and billing paused.', flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description='Experimental Xianniu classic-mode TCP/UDP client')
-    commands = parser.add_subparsers(dest='command', required=True)
+    commands = parser.add_subparsers(dest='command', required=True,
+                                    metavar='{login,serve,check,lines,stop,run,warframe}')
     login = commands.add_parser('login', help='Log in with a phone number; prompt for password without saving it')
     login.add_argument('--account', type=Path, required=True)
     login.add_argument('--mobile-code', type=int, default=86)
@@ -215,6 +247,7 @@ def main():
     serving.add_argument('--port', type=int, default=1080)
     serving.add_argument('--max-connections', type=int, default=128)
     serving.add_argument('--ready-file', type=Path)
+    serving.add_argument('--status-file', type=Path, help=argparse.SUPPRESS)
     serving.add_argument('--debug', action='store_true')
     checking = commands.add_parser('check', help='Check verified TLS and UDP DNS through the local adapter')
     checking.add_argument('--session', type=Path)
@@ -229,10 +262,23 @@ def main():
     namespace.add_argument('--account', type=Path)
     namespace.add_argument('--hev', default='hev-socks5-tunnel')
     namespace.add_argument('application', nargs=argparse.REMAINDER)
+    warframe = commands.add_parser('warframe', help='Wrap only Warframe: use in Steam launch options before %%command%%')
+    warframe.add_argument('--account', type=Path)
+    warframe.add_argument('--session', type=Path)
+    warframe.add_argument('--hev', default='hev-socks5-tunnel')
+    warframe.add_argument('--auth', choices=('pkexec', 'sudo'), default='pkexec')
+    warframe.add_argument('application', nargs=argparse.REMAINDER)
+    commands.add_parser('_warframe-helper')
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if getattr(args, 'debug', False) else logging.WARNING,
                         format='%(levelname)s %(message)s')
     try:
+        if args.command == 'warframe':
+            from .launch import warframe
+            return warframe(args)
+        if args.command == '_warframe-helper':
+            from .launch import privileged_launch
+            return privileged_launch()
         if args.command == 'login':
             if args.account.exists():
                 account = Account.load(args.account)
@@ -251,13 +297,14 @@ def main():
             mobile = input('Phone number: ').strip()
             password = getpass.getpass('Password (not saved): ')
             try:
-                data = ApiClient(account).login_password(mobile, password, args.mobile_code)
+                with AccountLock():
+                    data = ApiClient(account).login_password(mobile, password, args.mobile_code)
+                    if not isinstance(data, dict) or not isinstance(data.get('access_token'), str):
+                        raise ApiError('Login did not return an authorization token')
+                    account = replace(account, access_token=data['access_token'])
+                    write_private_json(args.account, asdict(account))
             finally:
                 password = ''
-            if not isinstance(data, dict) or not isinstance(data.get('access_token'), str):
-                raise ApiError('Login did not return an authorization token')
-            account = replace(account, access_token=data['access_token'])
-            write_private_json(args.account, asdict(account))
             print('Logged in. Authorization saved locally; password not stored.')
             return 0
         if args.command in ('serve', 'check', 'run'):
@@ -287,7 +334,8 @@ def main():
             return 0
         if args.command == 'stop':
             manager = Acceleration(Account.load(args.account), args.account.with_name('session-linux.json'))
-            manager.stop({}, force=True)
+            with AccountLock():
+                manager.stop({}, force=True)
             print('Server confirmed acceleration stopped and billing paused.')
             return 0
         return asyncio.run(managed_check(args) if args.account else check(args))
